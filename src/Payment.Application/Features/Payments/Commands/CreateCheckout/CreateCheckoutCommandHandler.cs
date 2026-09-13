@@ -109,8 +109,16 @@ public class CreateCheckoutCommandHandler : IRequestHandler<CreateCheckoutComman
                 "Failed to create checkout session. OrderId={OrderId}, PaymentId={PaymentId}",
                 order.Id, payment.Id);
 
-            // Revert order status since provider call failed
-            // In production, you'd use a background worker to handle this
+            // Compensating actions — the provider call failed (timeout, unavailable, etc.)
+            // after our DB commit. Bring local state back to a retryable shape:
+            //   attempt -> Failed (with reason)
+            //   payment -> Cancelled (never reached the provider)
+            //   order   -> Pending (customer can retry checkout)
+            attempt.MarkFailed(ex.Message);
+            payment.Cancel();
+            order.ReturnToPending();
+            await _context.SaveChangesAsync(cancellationToken);
+
             return Result<CreateCheckoutResponse>.Failure(
                 "Failed to create checkout session with payment provider.");
         }

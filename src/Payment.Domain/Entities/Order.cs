@@ -62,6 +62,20 @@ public class Order : BaseEntity
         Touch();
     }
 
+    /// <summary>
+    /// Compensation transition: returns the order to Pending when the payment provider
+    /// call failed (e.g. timeout/unavailable) so the customer can retry checkout.
+    /// Only allowed from PaymentProcessing — never from a terminal paid/failed state.
+    /// </summary>
+    public void ReturnToPending()
+    {
+        if (Status != OrderStatus.PaymentProcessing)
+            throw new InvalidStateTransitionException(nameof(Order), Status.ToString(), OrderStatus.Pending.ToString());
+
+        Status = OrderStatus.Pending;
+        Touch();
+    }
+
     public void MarkPaid()
     {
         if (Status != OrderStatus.PaymentProcessing)

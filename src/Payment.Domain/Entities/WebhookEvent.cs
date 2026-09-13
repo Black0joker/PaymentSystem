@@ -30,6 +30,17 @@ public class WebhookEvent : BaseEntity
         ProcessedAt = DateTime.UtcNow;
     }
 
+    /// <summary>
+    /// Resets a previously failed event so it can be reprocessed
+    /// (e.g. when the provider retries the webhook after our failure).
+    /// </summary>
+    public void MarkReceivedForRetry()
+    {
+        Status = WebhookEventStatus.Received;
+        ProcessedAt = null;
+        Error = null;
+    }
+
     public void MarkFailed(string error)
     {
         Status = WebhookEventStatus.Failed;

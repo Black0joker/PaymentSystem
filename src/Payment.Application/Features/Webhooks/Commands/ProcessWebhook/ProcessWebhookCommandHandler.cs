@@ -1,3 +1,4 @@
+using System.Text.Json;
 using MediatR;
 using Microsoft.Extensions.Logging;
 using Microsoft.EntityFrameworkCore;
@@ -6,6 +7,7 @@ using Payment.Application.Abstractions.Persistence;
 using Payment.Application.Common;
 using Payment.Domain.Entities;
 using Payment.Domain.Enums;
+using Payment.Domain.Events;
 using PaymentEntity = Payment.Domain.Entities.Payment;
 
 namespace Payment.Application.Features.Webhooks.Commands.ProcessWebhook;
@@ -47,15 +49,56 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
                 e.ProviderEventId == webhookEvent.EventId,
                 cancellationToken);
 
+        WebhookEvent webhookEventEntity;
+
         if (existingEvent != null)
         {
+            if (existingEvent.Status == WebhookEventStatus.Processed)
+            {
+                _logger.LogInformation(
+                    "Duplicate webhook received. EventId={EventId} already processed.",
+                    webhookEvent.EventId);
+                return Result.Success(); // Return 200 — duplicate is not an error
+            }
+
+            // Reprocess when the event is not fully processed:
+            //  - Failed:   a previous attempt errored; the provider is retrying.
+            //  - Received: inserted but the final commit never happened
+            //              (e.g. crash during commit — see Phase 7).
+            // Reprocessing is safe: every event handler is idempotent via the
+            // domain state-machine guards.
             _logger.LogInformation(
-                "Duplicate webhook received. EventId={EventId}, already processed.",
-                webhookEvent.EventId);
-            return Result.Success(); // Return 200 — duplicate is not an error
+                "Reprocessing unfinished webhook. EventId={EventId}, Status={Status}",
+                webhookEvent.EventId, existingEvent.Status);
+            existingEvent.MarkReceivedForRetry();
+            webhookEventEntity = existingEvent;
+        }
+        else
+        {
+            // 3. Record the webhook event (insert fails on unique constraint if race condition)
+            webhookEventEntity = new WebhookEvent(
+                webhookEvent.Provider,
+                webhookEvent.EventId,
+                webhookEvent.EventType,
+                request.Payload);
+
+            _context.WebhookEvents.Add(webhookEventEntity);
+
+            try
+            {
+                await _context.SaveChangesAsync(cancellationToken);
+            }
+            catch (DbUpdateException ex) when (IsUniqueConstraintViolation(ex))
+            {
+                // Race condition: another request already inserted this event
+                _logger.LogInformation(
+                    "Concurrent duplicate webhook detected. EventId={EventId}",
+                    webhookEvent.EventId);
+                return Result.Success();
+            }
         }
 
-        // 3. Map provider event to our domain concept
+        // 4. Map provider event to our domain concept
         var mappedType = webhookEvent.GetMappedEventType();
         if (mappedType == MappedEventType.Unknown)
         {
@@ -63,38 +106,8 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
                 "Ignoring unknown webhook event type: {EventType}",
                 webhookEvent.EventType);
 
-            // Still record the event so we don't process it again
-            var unknownEvent = new WebhookEvent(
-                webhookEvent.Provider,
-                webhookEvent.EventId,
-                webhookEvent.EventType,
-                request.Payload);
-            unknownEvent.MarkProcessed();
-            _context.WebhookEvents.Add(unknownEvent);
+            webhookEventEntity.MarkProcessed();
             await _context.SaveChangesAsync(cancellationToken);
-
-            return Result.Success();
-        }
-
-        // 4. Record the webhook event (insert will fail on unique constraint if race condition)
-        var webhookEventEntity = new WebhookEvent(
-            webhookEvent.Provider,
-            webhookEvent.EventId,
-            webhookEvent.EventType,
-            request.Payload);
-
-        _context.WebhookEvents.Add(webhookEventEntity);
-
-        try
-        {
-            await _context.SaveChangesAsync(cancellationToken);
-        }
-        catch (DbUpdateException ex) when (IsUniqueConstraintViolation(ex))
-        {
-            // Race condition: another request already inserted this event
-            _logger.LogInformation(
-                "Concurrent duplicate webhook detected. EventId={EventId}",
-                webhookEvent.EventId);
             return Result.Success();
         }
 
@@ -110,11 +123,24 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
                 "Failed to process webhook. EventId={EventId}, Type={Type}",
                 webhookEvent.EventId, webhookEvent.EventType);
 
+            // Discard any partial domain/outbox changes made during processing so a
+            // failed attempt leaves Payment/Order exactly as they were (atomicity).
+            foreach (var entry in _context.ChangeTracker.Entries()
+                .Where(e => !ReferenceEquals(e.Entity, webhookEventEntity)).ToList())
+            {
+                if (entry.State == EntityState.Modified)
+                    entry.State = EntityState.Unchanged;
+                else if (entry.State == EntityState.Added)
+                    entry.State = EntityState.Detached;
+            }
+
+            // Record the failure so the provider's retry can reprocess this event.
             webhookEventEntity.MarkFailed(ex.Message);
             await _context.SaveChangesAsync(cancellationToken);
             return Result.Failure($"Failed to process webhook: {ex.Message}");
         }
 
+        // 6. Single atomic commit: webhook event + payment + order + outbox messages
         await _context.SaveChangesAsync(cancellationToken);
 
         _logger.LogInformation(
@@ -168,7 +194,7 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
             throw new InvalidOperationException($"Payment not found for provider ID: {providerId}");
         }
 
-        // State machine: only transition if not already succeeded
+        // State machine + idempotency: already-succeeded is a no-op, not an error.
         if (payment.Status == PaymentStatus.Succeeded)
         {
             _logger.LogInformation(
@@ -185,6 +211,21 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
         {
             order.MarkPaid();
         }
+
+        // Outbox: enqueue domain events in the SAME transactional unit.
+        // If this save commits, the events are guaranteed to be published later.
+        // If anything fails before commit, no orphan events are published.
+        _context.OutboxMessages.Add(new OutboxMessage(
+            nameof(PaymentSucceededEvent),
+            JsonSerializer.Serialize(new PaymentSucceededEvent(
+                payment.Id, payment.OrderId, payment.ProviderPaymentId!,
+                payment.Amount, payment.Currency, DateTime.UtcNow))));
+
+        _context.OutboxMessages.Add(new OutboxMessage(
+            nameof(OrderPaidEvent),
+            JsonSerializer.Serialize(new OrderPaidEvent(
+                order.Id, order.UserId, payment.Id,
+                order.Total, order.Currency, DateTime.UtcNow))));
 
         _logger.LogInformation(
             "Payment succeeded. PaymentId={PaymentId}, OrderId={OrderId}",
@@ -212,6 +253,8 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
             throw new InvalidOperationException($"Payment not found for provider ID: {providerId}");
         }
 
+        // Out-of-order protection: if the payment already reached a terminal state
+        // (e.g. a 'failed' webhook arrives AFTER a 'succeeded' one), treat as no-op.
         if (payment.Status is PaymentStatus.Succeeded or PaymentStatus.Failed)
         {
             _logger.LogInformation(
@@ -227,6 +270,11 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
         {
             order.MarkFailed();
         }
+
+        _context.OutboxMessages.Add(new OutboxMessage(
+            nameof(PaymentFailedEvent),
+            JsonSerializer.Serialize(new PaymentFailedEvent(
+                payment.Id, payment.OrderId, webhookEvent.FailureReason, DateTime.UtcNow))));
 
         _logger.LogInformation(
             "Payment failed. PaymentId={PaymentId}, OrderId={OrderId}, Reason={Reason}",
