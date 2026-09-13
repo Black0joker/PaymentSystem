@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Payment.Application.Abstractions.Payments;
 using Payment.Domain.Exceptions;
 
 namespace Payment.Api.Middleware;
@@ -32,6 +33,7 @@ public class ExceptionHandlingMiddleware
         {
             NotFoundException => (StatusCodes.Status404NotFound, exception.Message),
             InvalidStateTransitionException => (StatusCodes.Status409Conflict, exception.Message),
+            WebhookVerificationException => (StatusCodes.Status400BadRequest, exception.Message),
             FluentValidation.ValidationException ve => (StatusCodes.Status400BadRequest,
                 string.Join("; ", ve.Errors.Select(e => e.ErrorMessage))),
             ArgumentException => (StatusCodes.Status400BadRequest, exception.Message),
@@ -41,6 +43,10 @@ public class ExceptionHandlingMiddleware
         if (statusCode == StatusCodes.Status500InternalServerError)
         {
             _logger.LogError(exception, "Unhandled exception: {Message}", exception.Message);
+        }
+        else
+        {
+            _logger.LogWarning(exception, "Handled exception ({StatusCode}): {Message}", statusCode, exception.Message);
         }
 
         context.Response.ContentType = "application/json";
