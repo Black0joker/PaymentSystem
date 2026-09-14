@@ -23,6 +23,10 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseMiddleware<ExceptionHandlingMiddleware>();
+
+// Phase 11: Redis-backed rate limiting for client-initiated endpoints
+app.UseMiddleware<RateLimitingMiddleware>();
+
 app.UseHttpsRedirection();
 app.UseAuthorization();
 app.MapControllers();

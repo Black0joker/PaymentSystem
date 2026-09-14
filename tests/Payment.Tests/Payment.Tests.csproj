@@ -21,9 +21,14 @@
   </ItemGroup>
 
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Payment.Domain\Payment.Domain.csproj" />
     <ProjectReference Include="..\..\src\Payment.Application\Payment.Application.csproj" />
     <ProjectReference Include="..\..\src\Payment.Infrastructure\Payment.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\src\Payment.Api\Payment.Api.csproj" />
   </ItemGroup>
 
 </Project>

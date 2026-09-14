@@ -2,6 +2,7 @@ using System.Text.Json;
 using MediatR;
 using Microsoft.Extensions.Logging;
 using Microsoft.EntityFrameworkCore;
+using Payment.Application.Abstractions.Caching;
 using Payment.Application.Abstractions.Payments;
 using Payment.Application.Abstractions.Persistence;
 using Payment.Application.Common;
@@ -17,15 +18,32 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
     private readonly IAppDbContext _context;
     private readonly IPaymentProvider _paymentProvider;
     private readonly ILogger<ProcessWebhookCommandHandler> _logger;
+    private readonly ICacheService _cache;
+    private readonly IDistributedLock _distributedLock;
+
+    private static readonly TimeSpan WebhookProcessedTtl = TimeSpan.FromHours(1);
+    private static readonly TimeSpan WebhookLockExpiry = TimeSpan.FromSeconds(30);
 
     public ProcessWebhookCommandHandler(
         IAppDbContext context,
         IPaymentProvider paymentProvider,
         ILogger<ProcessWebhookCommandHandler> logger)
+        : this(context, paymentProvider, logger, new NoOpCacheService(), new NoOpDistributedLock())
+    {
+    }
+
+    public ProcessWebhookCommandHandler(
+        IAppDbContext context,
+        IPaymentProvider paymentProvider,
+        ILogger<ProcessWebhookCommandHandler> logger,
+        ICacheService cache,
+        IDistributedLock distributedLock)
     {
         _context = context;
         _paymentProvider = paymentProvider;
         _logger = logger;
+        _cache = cache;
+        _distributedLock = distributedLock;
     }
 
     public async Task<Result> Handle(ProcessWebhookCommand request, CancellationToken cancellationToken)
@@ -42,6 +60,34 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
             return Result.Failure("Webhook signature verification failed.");
         }
 
+        // Phase 11 optimization: fast-path idempotency via the cache layer.
+        // The marker is written only after a fully committed successful
+        // processing, so a hit is always safe. Misses or cache failures fall
+        // through to the authoritative database check below.
+        if (await _cache.GetAsync<bool>(
+                CacheKeys.WebhookProcessed(webhookEvent.Provider, webhookEvent.EventId),
+                cancellationToken))
+        {
+            _logger.LogInformation(
+                "Duplicate webhook rejected by cache fast path. EventId={EventId}",
+                webhookEvent.EventId);
+            return Result.Success();
+        }
+
+        // Phase 11: serialize concurrent webhooks targeting the SAME payment.
+        // When the lock cannot be acquired (busy or cache store down) we
+        // proceed anyway — unique constraints and state-machine guards
+        // remain the correctness mechanism.
+        var webhookLockKey = webhookEvent.PaymentIntentId ?? webhookEvent.SessionId;
+        IAsyncDisposable? webhookLock = null;
+        if (!string.IsNullOrEmpty(webhookLockKey))
+        {
+            webhookLock = await _distributedLock.TryAcquireAsync(
+                CacheKeys.WebhookPaymentLock(webhookLockKey), WebhookLockExpiry, cancellationToken);
+        }
+
+        try
+        {
         // 2. Idempotency check — has this event already been processed?
         var existingEvent = await _context.WebhookEvents
             .FirstOrDefaultAsync(e =>
@@ -147,7 +193,19 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
             "Webhook processed successfully. EventId={EventId}, Type={Type}",
             webhookEvent.EventId, webhookEvent.EventType);
 
+        // Phase 11: remember successful processing so duplicate deliveries
+        // are rejected by the cache layer without touching the database.
+        await _cache.SetAsync(
+            CacheKeys.WebhookProcessed(webhookEvent.Provider, webhookEvent.EventId),
+            true, WebhookProcessedTtl, cancellationToken);
+
         return Result.Success();
+        }
+        finally
+        {
+            if (webhookLock is not null)
+                await webhookLock.DisposeAsync();
+        }
     }
 
     private async Task ProcessEventAsync(
@@ -232,6 +290,9 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
         // Update payment
         payment.MarkSucceeded();
 
+        // Phase 11: invalidate the cached payment read model (state changed).
+        await _cache.RemoveAsync(CacheKeys.PaymentStatus(payment.Id), cancellationToken);
+
         // Update order
         var order = payment.Order;
         if (order.Status == OrderStatus.PaymentProcessing)
@@ -291,6 +352,9 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
         }
 
         payment.MarkFailed();
+
+        // Phase 11: invalidate the cached payment read model (state changed).
+        await _cache.RemoveAsync(CacheKeys.PaymentStatus(payment.Id), cancellationToken);
 
         var order = payment.Order;
         if (order.Status == OrderStatus.PaymentProcessing)
@@ -353,6 +417,9 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
         var order = payment.Order;
 
         payment.MarkRefunded();
+
+        // Phase 11: invalidate the cached payment read model (state changed).
+        await _cache.RemoveAsync(CacheKeys.PaymentStatus(payment.Id), cancellationToken);
 
         // Order transitions: RefundProcessing -> Refunded (our flow).
         // Dashboard refunds arrive while the order is still Paid -> walk it through.

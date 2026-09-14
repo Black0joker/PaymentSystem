@@ -22,6 +22,8 @@ public interface IAppDbContext
     DbSet<WebhookEvent> WebhookEvents { get; }
     DbSet<OutboxMessage> OutboxMessages { get; }
     DbSet<Refund> Refunds { get; }
+    DbSet<Enrollment> Enrollments { get; }
+    DbSet<AnalyticsEvent> AnalyticsEvents { get; }
 
     /// <summary>
     /// Exposed so failure paths can discard partial in-memory changes

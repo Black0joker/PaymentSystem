@@ -20,6 +20,8 @@ public class AppDbContext : DbContext, IAppDbContext
     public DbSet<WebhookEvent> WebhookEvents => Set<WebhookEvent>();
     public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
     public DbSet<Refund> Refunds => Set<Refund>();
+    public DbSet<Enrollment> Enrollments => Set<Enrollment>();
+    public DbSet<AnalyticsEvent> AnalyticsEvents => Set<AnalyticsEvent>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

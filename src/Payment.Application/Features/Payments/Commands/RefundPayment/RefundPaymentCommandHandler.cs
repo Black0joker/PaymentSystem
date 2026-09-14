@@ -1,6 +1,7 @@
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using Payment.Application.Abstractions.Caching;
 using Payment.Application.Abstractions.Payments;
 using Payment.Application.Abstractions.Persistence;
 using Payment.Application.Common;
@@ -26,15 +27,31 @@ public class RefundPaymentCommandHandler : IRequestHandler<RefundPaymentCommand,
     private readonly IAppDbContext _context;
     private readonly IPaymentProvider _paymentProvider;
     private readonly ILogger<RefundPaymentCommandHandler> _logger;
+    private readonly IDistributedLock _distributedLock;
+    private readonly ICacheService _cache;
+
+    private static readonly TimeSpan RefundLockExpiry = TimeSpan.FromSeconds(30);
 
     public RefundPaymentCommandHandler(
         IAppDbContext context,
         IPaymentProvider paymentProvider,
         ILogger<RefundPaymentCommandHandler> logger)
+        : this(context, paymentProvider, logger, new NoOpDistributedLock(), new NoOpCacheService())
+    {
+    }
+
+    public RefundPaymentCommandHandler(
+        IAppDbContext context,
+        IPaymentProvider paymentProvider,
+        ILogger<RefundPaymentCommandHandler> logger,
+        IDistributedLock distributedLock,
+        ICacheService cache)
     {
         _context = context;
         _paymentProvider = paymentProvider;
         _logger = logger;
+        _distributedLock = distributedLock;
+        _cache = cache;
     }
 
     public async Task<Result<RefundPaymentResponse>> Handle(
@@ -49,6 +66,15 @@ public class RefundPaymentCommandHandler : IRequestHandler<RefundPaymentCommand,
         if (payment is null)
             return Result<RefundPaymentResponse>.Failure($"Payment not found: {request.PaymentId}");
 
+        // Phase 11: serialize concurrent refund requests for the same payment
+        // (e.g. a double-clicked refund button). If the lock is unavailable we
+        // proceed anyway — the state-machine guard below is authoritative:
+        // a second request will see RefundProcessing and be rejected.
+        var refundLock = await _distributedLock.TryAcquireAsync(
+            CacheKeys.RefundLock(payment.Id), RefundLockExpiry, cancellationToken);
+
+        try
+        {
         // 2. Validate refund eligibility
         if (payment.Status != PaymentStatus.Succeeded)
             return Result<RefundPaymentResponse>.Failure(
@@ -70,6 +96,9 @@ public class RefundPaymentCommandHandler : IRequestHandler<RefundPaymentCommand,
         payment.Order.StartRefund();
         _context.Refunds.Add(refund);
         await _context.SaveChangesAsync(cancellationToken);
+
+        // Phase 11: cached payment read model is stale once state changes.
+        await _cache.RemoveAsync(CacheKeys.PaymentStatus(payment.Id), cancellationToken);
 
         _logger.LogInformation(
             "Refund initiated. PaymentId={PaymentId}, RefundId={RefundId}, Amount={Amount} {Currency}",
@@ -99,6 +128,8 @@ public class RefundPaymentCommandHandler : IRequestHandler<RefundPaymentCommand,
             payment.Order.CancelRefund();
             await _context.SaveChangesAsync(cancellationToken);
 
+            await _cache.RemoveAsync(CacheKeys.PaymentStatus(payment.Id), cancellationToken);
+
             return Result<RefundPaymentResponse>.Failure($"Refund failed: {ex.Message}");
         }
 
@@ -115,5 +146,11 @@ public class RefundPaymentCommandHandler : IRequestHandler<RefundPaymentCommand,
             payment.Id,
             providerResult.ProviderRefundId,
             payment.Status.ToString()));
+        }
+        finally
+        {
+            if (refundLock is not null)
+                await refundLock.DisposeAsync();
+        }
     }
 }
