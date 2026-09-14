@@ -28,6 +28,29 @@ public class PaymentsController : ControllerBase
         return CreatedAtAction(nameof(GetPayment), new { id = result.Value }, new { paymentId = result.Value });
     }
 
+    /// <summary>
+    /// Initiates a refund for a succeeded payment.
+    /// Returns 202 Accepted — final confirmation arrives via refund webhook.
+    /// </summary>
+    [HttpPost("{id}/refund")]
+    public async Task<IActionResult> RefundPayment(Guid id, [FromBody] RefundPaymentRequest? request, CancellationToken cancellationToken)
+    {
+        var command = new Payment.Application.Features.Payments.Commands.RefundPayment.RefundPaymentCommand(id, request?.Reason);
+        var result = await _mediator.Send(command, cancellationToken);
+
+        if (!result.IsSuccess)
+            return BadRequest(new { error = result.Error });
+
+        var value = result.Value!;
+        return Accepted(new
+        {
+            refundId = value.RefundId,
+            paymentId = value.PaymentId,
+            providerRefundId = value.ProviderRefundId,
+            status = value.Status
+        });
+    }
+
     [HttpGet("{id}")]
     public async Task<IActionResult> GetPayment(Guid id, CancellationToken cancellationToken)
     {

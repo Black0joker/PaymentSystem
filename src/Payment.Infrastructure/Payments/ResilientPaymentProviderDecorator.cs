@@ -58,6 +58,16 @@ public class ResilientPaymentProviderDecorator : IPaymentProvider
             cancellationToken);
     }
 
+    public Task<RefundResult> CreateRefundAsync(
+        RefundRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        return ExecuteWithRetryAsync(
+            () => _inner.CreateRefundAsync(request, cancellationToken),
+            "CreateRefund",
+            cancellationToken);
+    }
+
     private async Task<T> ExecuteWithRetryAsync<T>(
         Func<Task<T>> operation,
         string operationName,

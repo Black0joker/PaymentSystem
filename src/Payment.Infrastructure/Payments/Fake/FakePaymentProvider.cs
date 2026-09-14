@@ -4,8 +4,8 @@ using Payment.Application.Abstractions.Payments;
 namespace Payment.Infrastructure.Payments.Fake;
 
 /// <summary>
-/// Fake payment provider for development and testing.
-/// Simulates successful checkout sessions and webhooks without hitting a real provider.
+/// Simulates payment provider behavior for local development and testing.
+/// Selected when PaymentProvider setting is "Fake".
 /// </summary>
 public class FakePaymentProvider : IPaymentProvider
 {
@@ -20,36 +20,21 @@ public class FakePaymentProvider : IPaymentProvider
         CheckoutRequest request,
         CancellationToken cancellationToken = default)
     {
-        var sessionId = $"fake_session_{Guid.NewGuid():N}";
-        var checkoutUrl = $"https://localhost:5001/fake-checkout/{sessionId}";
-
-        _logger.LogInformation(
-            "Fake checkout session created. SessionId={SessionId}, OrderId={OrderId}",
-            sessionId, request.OrderId);
-
         return Task.FromResult(new CheckoutSessionResult
         {
-            SessionId = sessionId,
-            CheckoutUrl = checkoutUrl,
+            SessionId = $"cs_fake_{Guid.NewGuid():N}",
+            CheckoutUrl = $"https://fake-checkout.local/{request.OrderId}",
             ExpiresAt = DateTime.UtcNow.AddMinutes(30)
         });
     }
 
     public PaymentWebhookEvent VerifyWebhook(string payload, string signature)
     {
-        // In fake mode, we accept any webhook without signature verification
-        // This is ONLY for development/testing
-        _logger.LogInformation("Fake webhook received. Payload={Payload}", payload);
-
-        // Parse the simple JSON payload
-        var eventId = $"fake_evt_{Guid.NewGuid():N}";
-
         return new PaymentWebhookEvent
         {
-            EventId = eventId,
+            EventId = $"evt_fake_{Guid.NewGuid():N}",
             EventType = "payment_intent.succeeded",
             Provider = "Fake",
-            PaymentIntentId = $"fake_pi_{Guid.NewGuid():N}",
             Status = "succeeded",
             RawPayload = payload
         };
@@ -66,6 +51,17 @@ public class FakePaymentProvider : IPaymentProvider
             Amount = 0,
             Currency = "USD",
             CompletedAt = DateTime.UtcNow
+        });
+    }
+
+    public Task<RefundResult> CreateRefundAsync(
+        RefundRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(new RefundResult
+        {
+            ProviderRefundId = $"re_fake_{Guid.NewGuid():N}",
+            Status = "succeeded"
         });
     }
 }

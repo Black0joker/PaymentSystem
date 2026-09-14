@@ -176,22 +176,49 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
         PaymentWebhookEvent webhookEvent,
         CancellationToken cancellationToken)
     {
-        // Find payment by provider payment ID (session ID or payment intent ID)
-        var providerId = webhookEvent.PaymentIntentId ?? webhookEvent.SessionId;
-        if (string.IsNullOrEmpty(providerId))
+        // Find payment by provider payment ID (session ID or payment intent ID).
+        // checkout.session.completed must be matched by SESSION ID first:
+        // checkout stores the session ID, and Stripe sends both IDs in that event,
+        // so a PaymentIntent-first lookup would never find the payment.
+        if (string.IsNullOrEmpty(webhookEvent.PaymentIntentId) && string.IsNullOrEmpty(webhookEvent.SessionId))
         {
             throw new InvalidOperationException("Webhook event does not contain a payment identifier.");
         }
 
-        var payment = await _context.Payments
-            .Include(p => p.Order)
-            .FirstOrDefaultAsync(p => p.ProviderPaymentId == providerId, cancellationToken);
+        Payment.Domain.Entities.Payment? payment = null;
+
+        if (!string.IsNullOrEmpty(webhookEvent.SessionId))
+        {
+            var sessionId = webhookEvent.SessionId;
+            payment = await _context.Payments
+                .Include(p => p.Order)
+                .FirstOrDefaultAsync(p => p.ProviderPaymentId == sessionId, cancellationToken);
+        }
+
+        if (payment is null && !string.IsNullOrEmpty(webhookEvent.PaymentIntentId))
+        {
+            var intentId = webhookEvent.PaymentIntentId;
+            payment = await _context.Payments
+                .Include(p => p.Order)
+                .FirstOrDefaultAsync(p => p.ProviderPaymentId == intentId, cancellationToken);
+        }
 
         if (payment is null)
         {
             _logger.LogWarning(
-                "Payment not found for provider ID: {ProviderId}", providerId);
-            throw new InvalidOperationException($"Payment not found for provider ID: {providerId}");
+                "Payment not found for webhook. SessionId={SessionId}, PaymentIntentId={PaymentIntentId}",
+                webhookEvent.SessionId, webhookEvent.PaymentIntentId);
+            throw new InvalidOperationException(
+                $"Payment not found. SessionId={webhookEvent.SessionId}, PaymentIntentId={webhookEvent.PaymentIntentId}");
+        }
+
+        // Real-flow fix: checkout stores the SESSION ID as ProviderPaymentId.
+        // Upgrade it to the PaymentIntent ID once known so subsequent webhooks
+        // (payment_intent.*) and provider reconciliation can locate the payment.
+        if (!string.IsNullOrEmpty(webhookEvent.PaymentIntentId) &&
+            payment.ProviderPaymentId != webhookEvent.PaymentIntentId)
+        {
+            payment.SetProviderPaymentId(webhookEvent.PaymentIntentId);
         }
 
         // State machine + idempotency: already-succeeded is a no-op, not an error.
@@ -302,19 +329,63 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
             throw new InvalidOperationException($"Payment not found for provider ID: {providerId}");
         }
 
-        if (payment.Status != PaymentStatus.Succeeded)
+        // Idempotency: already refunded -> no-op.
+        if (payment.Status == PaymentStatus.Refunded)
+        {
+            _logger.LogInformation(
+                "Payment already refunded. PaymentId={PaymentId}", payment.Id);
+            return;
+        }
+
+        // Refunds can only be confirmed from RefundProcessing (our refund flow) or
+        // Succeeded (refunds issued outside our system, e.g. provider dashboard).
+        // Any other state means events arrived out of order -> throw so the event
+        // is recorded Failed and reprocessed when the provider retries.
+        if (payment.Status is not (PaymentStatus.RefundProcessing or PaymentStatus.Succeeded))
         {
             _logger.LogWarning(
                 "Cannot refund payment in state: {Status}. PaymentId={PaymentId}",
                 payment.Status, payment.Id);
-            return;
+            throw new InvalidOperationException(
+                $"Cannot refund payment in state: {payment.Status}");
         }
+
+        var order = payment.Order;
 
         payment.MarkRefunded();
 
+        // Order transitions: RefundProcessing -> Refunded (our flow).
+        // Dashboard refunds arrive while the order is still Paid -> walk it through.
+        if (order.Status == OrderStatus.RefundProcessing)
+        {
+            order.MarkRefunded();
+        }
+        else if (order.Status == OrderStatus.Paid)
+        {
+            order.StartRefund();
+            order.MarkRefunded();
+        }
+
+        // Confirm the matching refund record, if one exists
+        var refund = !string.IsNullOrEmpty(webhookEvent.RefundId)
+            ? await _context.Refunds.FirstOrDefaultAsync(
+                r => r.ProviderRefundId == webhookEvent.RefundId, cancellationToken)
+            : await _context.Refunds
+                .Where(r => r.PaymentId == payment.Id && r.Status == RefundStatus.Pending)
+                .OrderByDescending(r => r.CreatedAt)
+                .FirstOrDefaultAsync(cancellationToken);
+
+        refund?.MarkSucceeded();
+
+        // Outbox: publish OrderRefundedEvent in the same transactional unit
+        _context.OutboxMessages.Add(new OutboxMessage(
+            nameof(OrderRefundedEvent),
+            JsonSerializer.Serialize(new OrderRefundedEvent(
+                order.Id, payment.Id, payment.Amount, payment.Currency, DateTime.UtcNow))));
+
         _logger.LogInformation(
             "Payment refunded. PaymentId={PaymentId}, OrderId={OrderId}",
-            payment.Id, payment.OrderId);
+            payment.Id, order.Id);
     }
 
     private static bool IsUniqueConstraintViolation(DbUpdateException ex)

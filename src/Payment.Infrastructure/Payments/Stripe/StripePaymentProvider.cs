@@ -7,20 +7,21 @@ using Stripe.Checkout;
 namespace Payment.Infrastructure.Payments.Stripe;
 
 /// <summary>
-/// Stripe implementation of the payment provider abstraction.
-/// All Stripe-specific code lives here — it never leaks into Application or Domain.
+/// Stripe payment provider implementation.
+/// Maps domain concepts to Stripe API calls and webhooks.
 /// </summary>
 public class StripePaymentProvider : IPaymentProvider
 {
     private readonly StripeSettings _settings;
     private readonly ILogger<StripePaymentProvider> _logger;
 
-    public StripePaymentProvider(
-        IOptions<StripeSettings> settings,
-        ILogger<StripePaymentProvider> logger)
+    public StripePaymentProvider(IOptions<StripeSettings> settings, ILogger<StripePaymentProvider> logger)
     {
         _settings = settings.Value;
         _logger = logger;
+
+        // Stripe requires the API key to be set before any API call.
+        StripeConfiguration.ApiKey = _settings.SecretKey;
     }
 
     public async Task<CheckoutSessionResult> CreateCheckoutSessionAsync(
@@ -35,7 +36,7 @@ public class StripePaymentProvider : IPaymentProvider
                 PriceData = new SessionLineItemPriceDataOptions
                 {
                     Currency = request.Currency.ToLowerInvariant(),
-                    UnitAmountDecimal = item.UnitPrice * 100, // Stripe uses cents
+                    UnitAmount = (long)(item.UnitPrice * 100),
                     ProductData = new SessionLineItemPriceDataProductDataOptions
                     {
                         Name = item.Name
@@ -123,6 +124,48 @@ public class StripePaymentProvider : IPaymentProvider
         };
     }
 
+    public async Task<RefundResult> CreateRefundAsync(
+        RefundRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var options = new RefundCreateOptions
+        {
+            PaymentIntent = request.ProviderPaymentId,
+            Amount = (long)(request.Amount * 100),
+            Reason = MapRefundReason(request.Reason)
+        };
+
+        try
+        {
+            var service = new RefundService();
+            var refund = await service.CreateAsync(options, cancellationToken: cancellationToken);
+
+            _logger.LogInformation(
+                "Stripe refund created. RefundId={RefundId}, PaymentIntent={PaymentIntent}, Status={Status}",
+                refund.Id, refund.PaymentIntentId, refund.Status);
+
+            return new RefundResult
+            {
+                ProviderRefundId = refund.Id,
+                Status = refund.Status
+            };
+        }
+        catch (StripeException ex)
+        {
+            _logger.LogError(ex,
+                "Failed to create Stripe refund. ProviderPaymentId={ProviderPaymentId}, Error={Error}",
+                request.ProviderPaymentId, ex.StripeError?.Message);
+            throw;
+        }
+    }
+
+    private static string MapRefundReason(string? reason) => reason?.ToLowerInvariant() switch
+    {
+        "duplicate" => "duplicate",
+        "fraudulent" or "fraud" => "fraudulent",
+        _ => "requested_by_customer"
+    };
+
     private static PaymentWebhookEvent MapStripeEvent(Event stripeEvent, string rawPayload)
     {
         var webhookEvent = new PaymentWebhookEvent
@@ -166,6 +209,8 @@ public class StripePaymentProvider : IPaymentProvider
                     webhookEvent.PaymentIntentId = charge.PaymentIntentId;
                     webhookEvent.Amount = charge.Amount / 100m;
                     webhookEvent.Currency = charge.Currency?.ToUpperInvariant();
+                    // Best-effort refund ID (present when Stripe expands the refunds list)
+                    webhookEvent.RefundId = charge.Refunds?.Data?.FirstOrDefault()?.Id;
                 }
                 break;
         }

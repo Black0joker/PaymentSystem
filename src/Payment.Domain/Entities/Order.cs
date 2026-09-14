@@ -111,4 +111,41 @@ public class Order : BaseEntity
         Status = OrderStatus.Expired;
         Touch();
     }
+
+    /// <summary>
+    /// Starts the refund flow: Paid -> RefundProcessing.
+    /// </summary>
+    public void StartRefund()
+    {
+        if (Status != OrderStatus.Paid)
+            throw new InvalidStateTransitionException(nameof(Order), Status.ToString(), OrderStatus.RefundProcessing.ToString());
+
+        Status = OrderStatus.RefundProcessing;
+        Touch();
+    }
+
+    /// <summary>
+    /// Confirms the refund once the provider webhook arrives.
+    /// </summary>
+    public void MarkRefunded()
+    {
+        if (Status != OrderStatus.RefundProcessing)
+            throw new InvalidStateTransitionException(nameof(Order), Status.ToString(), OrderStatus.Refunded.ToString());
+
+        Status = OrderStatus.Refunded;
+        Touch();
+    }
+
+    /// <summary>
+    /// Compensation transition: the provider refund call failed, so the order
+    /// returns to Paid (the purchase is still valid).
+    /// </summary>
+    public void CancelRefund()
+    {
+        if (Status != OrderStatus.RefundProcessing)
+            throw new InvalidStateTransitionException(nameof(Order), Status.ToString(), OrderStatus.Paid.ToString());
+
+        Status = OrderStatus.Paid;
+        Touch();
+    }
 }

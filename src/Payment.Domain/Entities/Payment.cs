@@ -73,9 +73,40 @@ public class Payment : BaseEntity
         Touch();
     }
 
-    public void MarkRefunded()
+    /// <summary>
+    /// Starts the refund flow: Succeeded -> RefundProcessing.
+    /// The payment is NOT considered refunded until the provider confirms it
+    /// (refund webhook), per the plan's Phase 9 rule.
+    /// </summary>
+    public void StartRefund()
     {
         if (Status != PaymentStatus.Succeeded)
+            throw new InvalidStateTransitionException(nameof(Payment), Status.ToString(), PaymentStatus.RefundProcessing.ToString());
+
+        Status = PaymentStatus.RefundProcessing;
+        Touch();
+    }
+
+    /// <summary>
+    /// Compensation transition: the provider refund call failed, so the payment
+    /// returns to Succeeded (the money is still captured).
+    /// </summary>
+    public void CancelRefund()
+    {
+        if (Status != PaymentStatus.RefundProcessing)
+            throw new InvalidStateTransitionException(nameof(Payment), Status.ToString(), PaymentStatus.Succeeded.ToString());
+
+        Status = PaymentStatus.Succeeded;
+        Touch();
+    }
+
+    /// <summary>
+    /// Confirms the refund. Allowed from RefundProcessing (our flow) and from
+    /// Succeeded (refunds issued outside our system, e.g. provider dashboard).
+    /// </summary>
+    public void MarkRefunded()
+    {
+        if (Status is not (PaymentStatus.Succeeded or PaymentStatus.RefundProcessing))
             throw new InvalidStateTransitionException(nameof(Payment), Status.ToString(), PaymentStatus.Refunded.ToString());
 
         Status = PaymentStatus.Refunded;

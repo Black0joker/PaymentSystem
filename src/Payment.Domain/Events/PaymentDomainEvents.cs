@@ -26,3 +26,10 @@ public record PaymentFailedEvent(
     Guid OrderId,
     string? Reason,
     DateTime OccurredAt);
+
+public record OrderRefundedEvent(
+    Guid OrderId,
+    Guid PaymentId,
+    decimal Amount,
+    string Currency,
+    DateTime OccurredAt);

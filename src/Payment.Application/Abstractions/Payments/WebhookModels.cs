@@ -11,6 +11,10 @@ public class PaymentWebhookEvent
     public string Provider { get; set; } = null!;
     public string? PaymentIntentId { get; set; }
     public string? SessionId { get; set; }
+
+    /// <summary>Provider refund ID (set on refund webhooks, e.g. charge.refunded).</summary>
+    public string? RefundId { get; set; }
+
     public string? Status { get; set; }
     public decimal? Amount { get; set; }
     public string? Currency { get; set; }

@@ -11,6 +11,7 @@ using Payment.Infrastructure.Payments;
 using Payment.Infrastructure.Payments.Fake;
 using Payment.Infrastructure.Payments.Stripe;
 using Payment.Infrastructure.Persistence;
+using Payment.Infrastructure.Reconciliation;
 
 namespace Payment.Infrastructure;
 
@@ -63,6 +64,10 @@ public static class DependencyInjection
         services.Configure<OutboxOptions>(configuration.GetSection(OutboxOptions.SectionName));
         services.AddSingleton<IOutboxPublisher, LoggingOutboxPublisher>();
         services.AddHostedService<OutboxProcessorWorker>();
+
+        // Reconciliation (Phase 10): repair payments stuck in Pending/Processing
+        services.Configure<ReconciliationOptions>(configuration.GetSection(ReconciliationOptions.SectionName));
+        services.AddHostedService<PaymentReconciliationWorker>();
 
         return services;
     }

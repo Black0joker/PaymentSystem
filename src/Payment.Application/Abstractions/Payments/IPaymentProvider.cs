@@ -27,4 +27,13 @@ public interface IPaymentProvider
     Task<ProviderPaymentDetails> GetPaymentAsync(
         string providerPaymentId,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Initiates a refund for a captured payment.
+    /// The refund is NOT considered final until the provider confirms it
+    /// via a refund webhook — this call only starts the flow.
+    /// </summary>
+    Task<RefundResult> CreateRefundAsync(
+        RefundRequest request,
+        CancellationToken cancellationToken = default);
 }
