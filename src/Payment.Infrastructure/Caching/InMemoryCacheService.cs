@@ -28,7 +28,8 @@ public class InMemoryCacheService : ICacheService
 
     public Task SetAsync<T>(string key, T value, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
-        _store[key] = new Entry(value, DateTime.UtcNow.Add(ttl));
+        var newEntry = new Entry(value, DateTime.UtcNow.Add(ttl));
+        _store.AddOrUpdate(key, newEntry, (_, _) => newEntry);
         return Task.CompletedTask;
     }
 
@@ -45,6 +46,19 @@ public class InMemoryCacheService : ICacheService
             return cached;
 
         var value = await factory();
+        var newEntry = new Entry(value, DateTime.UtcNow.Add(ttl));
+
+        // Add-only: don't overwrite a value populated concurrently while factory was running.
+        if (_store.TryAdd(key, newEntry))
+            return value;
+
+        if (_store.TryGetValue(key, out var existing)
+            && existing.ExpiresAt > DateTime.UtcNow
+            && existing.Value is T existingValue
+            && existingValue is not null)
+            return existingValue;
+
+        // Existing entry expired/incompatible: upsert the computed value.
         await SetAsync(key, value, ttl, cancellationToken);
         return value;
     }
