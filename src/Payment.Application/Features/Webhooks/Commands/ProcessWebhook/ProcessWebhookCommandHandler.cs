@@ -75,15 +75,16 @@ public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookComman
         }
 
         // Phase 11: serialize concurrent webhooks targeting the SAME payment.
-        // When the lock cannot be acquired (busy or cache store down) we
-        // proceed anyway — unique constraints and state-machine guards
-        // remain the correctness mechanism.
+        // Both Busy and Unavailable fall through — unique constraints on
+        // WebhookEvents and state-machine guards remain the correctness
+        // mechanism (duplicate deliveries are idempotent).
         var webhookLockKey = webhookEvent.PaymentIntentId ?? webhookEvent.SessionId;
         IAsyncDisposable? webhookLock = null;
         if (!string.IsNullOrEmpty(webhookLockKey))
         {
-            webhookLock = await _distributedLock.TryAcquireAsync(
+            var webhookLockResult = await _distributedLock.TryAcquireAsync(
                 CacheKeys.WebhookPaymentLock(webhookLockKey), WebhookLockExpiry, cancellationToken);
+            webhookLock = webhookLockResult.Handle;
         }
 
         try

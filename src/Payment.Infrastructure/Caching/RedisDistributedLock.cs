@@ -36,13 +36,13 @@ end";
         _logger = logger;
     }
 
-    public async Task<IAsyncDisposable?> TryAcquireAsync(string key, TimeSpan expiry, CancellationToken cancellationToken = default)
+    public async Task<LockAcquisitionResult> TryAcquireAsync(string key, TimeSpan expiry, CancellationToken cancellationToken = default)
     {
         try
         {
             var connection = await _connectionFactory.GetConnectionAsync(cancellationToken);
             if (connection is null)
-                return null;
+                return new LockAcquisitionResult(LockAcquireStatus.Unavailable, null);
 
             var fullKey = _connectionFactory.PrefixedKey("lock:" + key);
             var token = Guid.NewGuid().ToString();
@@ -51,14 +51,20 @@ end";
                 .StringSetAsync(fullKey, token, expiry, When.NotExists);
 
             if (!acquired)
-                return null;
+                return new LockAcquisitionResult(LockAcquireStatus.Busy, null);
 
-            return new LockHandle(connection, _connectionFactory, fullKey, token);
+            return new LockAcquisitionResult(
+                LockAcquireStatus.Acquired,
+                new LockHandle(connection, _connectionFactory, fullKey, token));
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Lock acquisition failed for {Key}; proceeding without lock.", key);
-            return null;
+            _logger.LogDebug(ex, "Lock acquisition failed for {Key}; falling back without lock.", key);
+            return new LockAcquisitionResult(LockAcquireStatus.Unavailable, null);
         }
     }
 

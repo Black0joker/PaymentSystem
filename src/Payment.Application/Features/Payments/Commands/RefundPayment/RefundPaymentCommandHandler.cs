@@ -67,11 +67,29 @@ public class RefundPaymentCommandHandler : IRequestHandler<RefundPaymentCommand,
             return Result<RefundPaymentResponse>.Failure($"Payment not found: {request.PaymentId}");
 
         // Phase 11: serialize concurrent refund requests for the same payment
-        // (e.g. a double-clicked refund button). If the lock is unavailable we
-        // proceed anyway — the state-machine guard below is authoritative:
-        // a second request will see RefundProcessing and be rejected.
-        var refundLock = await _distributedLock.TryAcquireAsync(
+        // (e.g. a double-clicked refund button). Busy means another request
+        // holds the lock -> fail fast with 409-style failure, never run the
+        // provider call twice. Unavailable means the lock store is down ->
+        // fall back to the state-machine guards below (a second request will
+        // see RefundProcessing and be rejected).
+        var lockResult = await _distributedLock.TryAcquireAsync(
             CacheKeys.RefundLock(payment.Id), RefundLockExpiry, cancellationToken);
+
+        if (lockResult.Status == LockAcquireStatus.Busy)
+        {
+            _logger.LogInformation(
+                "Refund already in progress. PaymentId={PaymentId}", payment.Id);
+            return Result<RefundPaymentResponse>.Failure(
+                $"Refund already in progress for payment {payment.Id}.");
+        }
+
+        if (lockResult.Status == LockAcquireStatus.Unavailable)
+        {
+            _logger.LogWarning(
+                "Refund lock unavailable, proceeding via DB guards. PaymentId={PaymentId}", payment.Id);
+        }
+
+        var refundLock = lockResult.Handle;
 
         try
         {

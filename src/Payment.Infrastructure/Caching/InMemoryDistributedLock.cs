@@ -27,13 +27,15 @@ public class InMemoryDistributedLock : IDistributedLock
         }
     }
 
-    public Task<IAsyncDisposable?> TryAcquireAsync(string key, TimeSpan expiry, CancellationToken cancellationToken = default)
+    public Task<LockAcquisitionResult> TryAcquireAsync(string key, TimeSpan expiry, CancellationToken cancellationToken = default)
     {
         var semaphore = Locks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
 
-        // Non-blocking attempt: the caller must be able to fall through to
-        // the domain guards when the resource is busy.
+        // Non-blocking attempt: Busy means another request holds the lock.
+        // The in-memory store itself is always available, so Unavailable never occurs here.
         var acquired = semaphore.Wait(0, cancellationToken);
-        return Task.FromResult<IAsyncDisposable?>(acquired ? new Handle(semaphore) : null);
+        return Task.FromResult(acquired
+            ? new LockAcquisitionResult(LockAcquireStatus.Acquired, new Handle(semaphore))
+            : new LockAcquisitionResult(LockAcquireStatus.Busy, null));
     }
 }

@@ -39,7 +39,13 @@ public class PaymentsController : ControllerBase
         var result = await _mediator.Send(command, cancellationToken);
 
         if (!result.IsSuccess)
+        {
+            // Concurrent refund for the same payment -> 409, not 400.
+            if (result.Error?.Contains("already in progress", StringComparison.OrdinalIgnoreCase) == true)
+                return Conflict(new { error = result.Error });
+
             return BadRequest(new { error = result.Error });
+        }
 
         var value = result.Value!;
         return Accepted(new

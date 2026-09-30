@@ -1,3 +1,4 @@
+using Payment.Application.Abstractions.Caching;
 using Payment.Infrastructure.Caching;
 
 namespace Payment.Tests.Infrastructure;
@@ -79,18 +80,21 @@ public class InMemoryCachingTests
         var locker = new InMemoryDistributedLock();
 
         var first = await locker.TryAcquireAsync("resource", TimeSpan.FromSeconds(30));
-        Assert.NotNull(first);
+        Assert.Equal(LockAcquireStatus.Acquired, first.Status);
+        Assert.NotNull(first.Handle);
 
-        // While held, a second attempt must fail (returns null), NOT block.
+        // While held, a second attempt must fail (Busy), NOT block.
         var second = await locker.TryAcquireAsync("resource", TimeSpan.FromSeconds(30));
-        Assert.Null(second);
+        Assert.Equal(LockAcquireStatus.Busy, second.Status);
+        Assert.Null(second.Handle);
 
-        await first!.DisposeAsync();
+        await first.Handle!.DisposeAsync();
 
         // After release the resource is available again.
         var third = await locker.TryAcquireAsync("resource", TimeSpan.FromSeconds(30));
-        Assert.NotNull(third);
-        await third!.DisposeAsync();
+        Assert.Equal(LockAcquireStatus.Acquired, third.Status);
+        Assert.NotNull(third.Handle);
+        await third.Handle!.DisposeAsync();
     }
 
     [Fact]
@@ -101,10 +105,12 @@ public class InMemoryCachingTests
         var a = await locker.TryAcquireAsync("resource-a", TimeSpan.FromSeconds(30));
         var b = await locker.TryAcquireAsync("resource-b", TimeSpan.FromSeconds(30));
 
-        Assert.NotNull(a);
-        Assert.NotNull(b);
+        Assert.Equal(LockAcquireStatus.Acquired, a.Status);
+        Assert.NotNull(a.Handle);
+        Assert.Equal(LockAcquireStatus.Acquired, b.Status);
+        Assert.NotNull(b.Handle);
 
-        await a!.DisposeAsync();
-        await b!.DisposeAsync();
+        await a.Handle!.DisposeAsync();
+        await b.Handle!.DisposeAsync();
     }
 }

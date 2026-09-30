@@ -27,6 +27,6 @@ public sealed class NoOpDistributedLock : IDistributedLock
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
-    public Task<IAsyncDisposable?> TryAcquireAsync(string key, TimeSpan expiry, CancellationToken cancellationToken = default) =>
-        Task.FromResult<IAsyncDisposable?>(new Handle());
+    public Task<LockAcquisitionResult> TryAcquireAsync(string key, TimeSpan expiry, CancellationToken cancellationToken = default) =>
+        Task.FromResult(new LockAcquisitionResult(LockAcquireStatus.Acquired, new Handle()));
 }

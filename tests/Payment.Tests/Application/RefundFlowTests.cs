@@ -2,6 +2,7 @@ using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Moq;
+using Payment.Application.Abstractions.Caching;
 using Payment.Application.Abstractions.Payments;
 using Payment.Application.Features.Payments.Commands.RefundPayment;
 using Payment.Application.Features.Webhooks.Commands.ProcessWebhook;
@@ -172,6 +173,79 @@ public class RefundFlowTests : IDisposable
             new RefundPaymentCommand(Guid.NewGuid(), null), CancellationToken.None);
 
         Assert.False(result.IsSuccess);
+    }
+
+    // ---------- Distributed lock contention (Busy vs Unavailable) ----------
+
+    private sealed class StubDistributedLock : IDistributedLock
+    {
+        private readonly LockAcquireStatus _status;
+
+        public StubDistributedLock(LockAcquireStatus status) => _status = status;
+
+        public Task<LockAcquisitionResult> TryAcquireAsync(string key, TimeSpan expiry, CancellationToken cancellationToken = default)
+        {
+            IAsyncDisposable? handle = _status == LockAcquireStatus.Acquired
+                ? new NoOpHandle()
+                : null;
+            return Task.FromResult(new LockAcquisitionResult(_status, handle));
+        }
+
+        private sealed class NoOpHandle : IAsyncDisposable
+        {
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task RefundPayment_LockBusy_ShouldFailFastWithoutProviderCall()
+    {
+        var (order, payment) = await SeedPaidOrderAsync();
+
+        var handler = new RefundPaymentCommandHandler(
+            _context,
+            _paymentProviderMock.Object,
+            Mock.Of<ILogger<RefundPaymentCommandHandler>>(),
+            new StubDistributedLock(LockAcquireStatus.Busy),
+            new NoOpCacheService());
+
+        var result = await handler.Handle(
+            new RefundPaymentCommand(payment.Id, null), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Contains("already in progress", result.Error);
+
+        // No DB state changed, provider never called — no double refund.
+        _paymentProviderMock.Verify(
+            p => p.CreateRefundAsync(It.IsAny<RefundRequest>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        Assert.Empty(_context.Refunds);
+        Assert.Equal(PaymentStatus.Succeeded, payment.Status);
+        Assert.Equal(OrderStatus.Paid, order.Status);
+    }
+
+    [Fact]
+    public async Task RefundPayment_LockUnavailable_ShouldProceedViaDbGuards()
+    {
+        var (order, payment) = await SeedPaidOrderAsync();
+
+        _paymentProviderMock
+            .Setup(p => p.CreateRefundAsync(It.IsAny<RefundRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new RefundResult { ProviderRefundId = "re_test_lockdown", Status = "succeeded" });
+
+        var handler = new RefundPaymentCommandHandler(
+            _context,
+            _paymentProviderMock.Object,
+            Mock.Of<ILogger<RefundPaymentCommandHandler>>(),
+            new StubDistributedLock(LockAcquireStatus.Unavailable),
+            new NoOpCacheService());
+
+        var result = await handler.Handle(
+            new RefundPaymentCommand(payment.Id, "customer request"), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(PaymentStatus.RefundProcessing, payment.Status);
+        Assert.Equal(OrderStatus.RefundProcessing, order.Status);
     }
 
     // ---------- Refund webhook confirmation (HandlePaymentRefundedAsync) ----------
